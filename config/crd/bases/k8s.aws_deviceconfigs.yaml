@@ -220,14 +220,19 @@ spec:
             x-kubernetes-validations:
             - message: draDriverImage is mutually exclusive with devicePluginImage,
                 customSchedulerImage, and schedulerExtensionImage
-              rule: '!(size(self.draDriverImage) > 0 && (size(self.devicePluginImage)
-                > 0 || size(self.customSchedulerImage) > 0 || size(self.schedulerExtensionImage)
-                > 0))'
+              rule: '!((has(self.draDriverImage) && size(self.draDriverImage) > 0)
+                && ((has(self.devicePluginImage) && size(self.devicePluginImage) >
+                0) || (has(self.customSchedulerImage) && size(self.customSchedulerImage)
+                > 0) || (has(self.schedulerExtensionImage) && size(self.schedulerExtensionImage)
+                > 0)))'
             - message: devicePluginImage, customSchedulerImage, and schedulerExtensionImage
                 must all be set together
-              rule: '(size(self.devicePluginImage) > 0 || size(self.customSchedulerImage)
-                > 0 || size(self.schedulerExtensionImage) > 0) ? (size(self.devicePluginImage)
-                > 0 && size(self.customSchedulerImage) > 0 && size(self.schedulerExtensionImage)
+              rule: '(has(self.devicePluginImage) && size(self.devicePluginImage)
+                > 0 || has(self.customSchedulerImage) && size(self.customSchedulerImage)
+                > 0 || has(self.schedulerExtensionImage) && size(self.schedulerExtensionImage)
+                > 0) ? (has(self.devicePluginImage) && size(self.devicePluginImage)
+                > 0 && has(self.customSchedulerImage) && size(self.customSchedulerImage)
+                > 0 && has(self.schedulerExtensionImage) && size(self.schedulerExtensionImage)
                 > 0) : true'
           status:
             description: ModuleStatus defines the observed state of Module.
