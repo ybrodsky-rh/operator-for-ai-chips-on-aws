@@ -401,19 +401,298 @@ oc get pod -n aws-neuron-operator -l app.kubernetes.io/name=aws-neuron \
 
 ---
 
+## Test Case 10: vLLM Inference Workload with DRA
+
+**Objective:** Verify that a full vLLM inference workload can deploy, load a model, and serve requests using DRA-allocated Neuron devices (replacing the device-plugin `aws.amazon.com/neuron` resource model).
+
+### Prerequisites
+
+- HuggingFace token with access to `meta-llama/Llama-3.1-8B-Instruct`
+- `gp3-csi` StorageClass available for model cache PVC
+- Red Hat registry pull secret (for `registry.redhat.io/rhaiis/vllm-neuron-rhel9:3`)
+
+### Steps
+
+1. Create the namespace and HuggingFace token secret:
+
+```bash
+oc create namespace neuron-inference
+oc create secret generic hf-token -n neuron-inference \
+  --from-literal=HF_TOKEN=<your-hf-token>
+```
+
+2. Create the model cache PVC:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache
+  namespace: neuron-inference
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: gp3-csi
+```
+
+3. Create the ResourceClaimTemplate for DRA device allocation:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: neuron-vllm-claim
+  namespace: neuron-inference
+spec:
+  spec:
+    devices:
+      requests:
+      - name: neuron
+        firstAvailable:
+        - name: neuron-request
+          deviceClassName: neuron.aws.com
+          count: 1
+```
+
+4. Create the vLLM Deployment (DRA mode — no `schedulerName`, no `aws.amazon.com/neuron` resources):
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neuron-vllm
+  namespace: neuron-inference
+  labels:
+    app: neuron-vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: neuron-vllm
+  template:
+    metadata:
+      labels:
+        app: neuron-vllm
+    spec:
+      volumes:
+        - name: model-volume
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "2Gi"
+      initContainers:
+        - name: fetch-model
+          image: python:3.11-slim
+          env:
+            - name: HF_HOME
+              value: /model
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+             set -ex
+             if [ ! -f "/model/config.json" ]; then
+              export PYTHONUSERBASE="/tmp/pip"
+              export PATH="$PYTHONUSERBASE/bin:$PATH"
+              pip install --no-cache-dir --user "huggingface_hub>=1.0"
+              $PYTHONUSERBASE/bin/hf download meta-llama/Llama-3.1-8B-Instruct --local-dir /model
+             else
+              echo "Model already present, skipping pull"
+             fi
+          volumeMounts:
+            - name: model-volume
+              mountPath: /model
+      containers:
+        - name: vllm-neuron
+          image: registry.redhat.io/rhaiis/vllm-neuron-rhel9:3
+          imagePullPolicy: IfNotPresent
+          workingDir: /model
+          env:
+            - name: NEURON_CACHE_URL
+              value: "/model/neuron_cache"
+          command:
+            - python
+            - '-m'
+            - vllm.entrypoints.openai.api_server
+          args:
+            - '--port=8000'
+            - '--model=/model'
+            - '--served-model-name=meta-llama/Llama-3.1-8B-Instruct'
+            - '--tensor-parallel-size=2'
+            - '--max-num-seqs=4'
+            - '--max-model-len=4096'
+            - '--block-size=16'
+            - '--no-enable-prefix-caching'
+            - '--no-enable-chunked-prefill'
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 900
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 900
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            limits:
+              memory: "100Gi"
+            requests:
+              memory: "10Gi"
+            claims:
+            - name: neuron-device
+          volumeMounts:
+            - name: model-volume
+              mountPath: /model
+            - name: shm
+              mountPath: /dev/shm
+      resourceClaims:
+      - name: neuron-device
+        resourceClaimTemplateName: neuron-vllm-claim
+      restartPolicy: Always
+```
+
+5. Create the Service and Route:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: neuron-vllm
+  namespace: neuron-inference
+spec:
+  selector:
+    app: neuron-vllm
+  ports:
+    - name: vllm-port
+      protocol: TCP
+      port: 80
+      targetPort: 8000
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: neuron-vllm
+  namespace: neuron-inference
+spec:
+  to:
+    kind: Service
+    name: neuron-vllm
+  port:
+    targetPort: vllm-port
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+```
+
+6. Wait for model download and Neuron compilation (15-30 min on first run):
+
+```bash
+oc logs -n neuron-inference -l app=neuron-vllm -c fetch-model -f
+oc logs -n neuron-inference -l app=neuron-vllm -c vllm-neuron -f
+```
+
+7. Verify the ResourceClaim was allocated via DRA:
+
+```bash
+oc get resourceclaim -n neuron-inference -o wide
+```
+
+8. Verify pod was scheduled by `default-scheduler` (not `neuron-scheduler`):
+
+```bash
+oc get events -n neuron-inference --field-selector reason=Scheduled
+```
+
+9. Test the vLLM models endpoint:
+
+```bash
+oc port-forward -n neuron-inference deployment/neuron-vllm 8000:8000 &
+curl -s http://localhost:8000/v1/models | python3 -m json.tool
+```
+
+10. Test chat completion inference:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "messages": [{"role": "user", "content": "What is Dynamic Resource Allocation in Kubernetes? Answer in one sentence."}],
+    "max_tokens": 100,
+    "temperature": 0.7
+  }' | python3 -m json.tool
+```
+
+11. Test text completion inference:
+
+```bash
+curl -s http://localhost:8000/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "prompt": "OpenShift is",
+    "max_tokens": 50,
+    "temperature": 0.5
+  }' | python3 -m json.tool
+```
+
+12. Cleanup:
+
+```bash
+oc delete namespace neuron-inference
+```
+
+### Key DRA Differences from Device-Plugin Mode
+
+| Aspect | Device-Plugin Mode | DRA Mode |
+|--------|-------------------|----------|
+| Scheduler | `schedulerName: neuron-scheduler` | Default scheduler |
+| Device request | `resources.limits.aws.amazon.com/neuron: 1` | `resourceClaims` + `ResourceClaimTemplate` |
+| Device allocation | Device plugin API (integer count) | ResourceClaim (structured parameters) |
+| Device class | N/A | `neuron.aws.com` DeviceClass |
+
+### Expected Results
+
+- ResourceClaimTemplate `neuron-vllm-claim` created
+- ResourceClaim shows `allocated,reserved` state with `neuron.aws.com` driver
+- Pod scheduled by `default-scheduler` to a Neuron node
+- Init container downloads model successfully
+- vLLM starts, compiles model for Neuron, and serves on port 8000
+- `/v1/models` returns `meta-llama/Llama-3.1-8B-Instruct`
+- `/v1/chat/completions` returns valid chat response
+- `/v1/completions` returns valid text completion
+- No `schedulerName` used — DRA replaces custom scheduler need
+
+---
+
 ## Test Results Summary
 
 | Test Case | Description | Result |
 |-----------|-------------|--------|
-| TC-1 | DRA DeviceConfig Creation | |
-| TC-2 | DRA Pod Spec Verification | |
-| TC-3 | Custom Scheduler Not Deployed | |
-| TC-4 | DRA Device Allocation via ResourceClaim | |
-| TC-5 | Custom DeviceClasses | |
-| TC-6 | Revert to Default DeviceClass | |
-| TC-7 | DeviceConfig Deletion Cascade | |
-| TC-8 | Re-create After Deletion | |
-| TC-9 | Error-Free Operation | |
+| TC-1 | DRA DeviceConfig Creation | PASS |
+| TC-2 | DRA Pod Spec Verification | PASS |
+| TC-3 | Custom Scheduler Not Deployed | PASS |
+| TC-4 | DRA Device Allocation via ResourceClaim | PASS |
+| TC-5 | Custom DeviceClasses | PASS |
+| TC-6 | Revert to Default DeviceClass | PASS |
+| TC-7 | DeviceConfig Deletion Cascade | PASS |
+| TC-8 | Re-create After Deletion | PASS |
+| TC-9 | Error-Free Operation | PASS |
+| TC-10 | vLLM Inference Workload with DRA | PASS |
 
 ## Environment
 

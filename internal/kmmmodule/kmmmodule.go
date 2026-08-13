@@ -206,9 +206,9 @@ func setKMMDevicePlugin(mod *kmmv1beta1.Module, devConfig *awslabsv1beta1.Device
 }
 
 const (
-	defaultDRADriverName     = "neuron.aws.com"
-	defaultDeviceClassName   = "neuron.aws.com"
-	draServiceAccountName    = "awslabs-gpu-operator-dra-driver"
+	defaultDRADriverName   = "neuron.aws.com"
+	defaultDeviceClassName = "neuron.aws.com"
+	draServiceAccountName  = "awslabs-gpu-operator-dra-driver"
 )
 
 func setKMMDRA(mod *kmmv1beta1.Module, devConfig *awslabsv1beta1.DeviceConfig) {
