@@ -232,7 +232,10 @@ func (dcrh *deviceConfigReconcilerHelper) finalizeDeviceConfig(ctx context.Conte
 		// KMM handles cascade deletion of DRA DaemonSets and DeviceClasses
 		// when the Module is deleted.
 		logger.Info("deleting KMM Module", "module", namespacedName)
-		return dcrh.client.Delete(ctx, &mod)
+		if err := dcrh.client.Delete(ctx, &mod); err != nil && !k8serrors.IsNotFound(err) {
+			return fmt.Errorf("failed to delete KMM Module %s: %v", namespacedName, err)
+		}
+		return nil
 	}
 
 	err = dcrh.upgradeHandler.RemoveUpgradeLabels(ctx, devConfig)
