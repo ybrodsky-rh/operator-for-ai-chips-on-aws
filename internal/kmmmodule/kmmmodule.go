@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -29,6 +30,7 @@ import (
 	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/configmap"
 	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/constants"
 	kmmv1beta1 "github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/utils/ptr"
 )
 
@@ -58,7 +60,9 @@ func (km *kmmModule) SetKMMModuleAsDesired(mod *kmmv1beta1.Module, devConfig *aw
 	if err != nil {
 		return fmt.Errorf("failed to set KMM Module: %v", err)
 	}
-	if devConfig.Spec.DevicePluginImage != "" {
+	if devConfig.Spec.DRADriverImage != "" {
+		setKMMDRA(mod, devConfig)
+	} else if devConfig.Spec.DevicePluginImage != "" {
 		setKMMDevicePlugin(mod, devConfig)
 	}
 	return controllerutil.SetControllerReference(devConfig, mod, km.scheme)
@@ -199,6 +203,64 @@ func setKMMDevicePlugin(mod *kmmv1beta1.Module, devConfig *awslabsv1beta1.Device
 		},
 		AutomountServiceAccountToken: ptr.To(false),
 	}
+}
+
+const (
+	defaultDRADriverName     = "neuron.aws.com"
+	defaultDeviceClassName   = "neuron.aws.com"
+	draServiceAccountName    = "awslabs-gpu-operator-dra-driver"
+)
+
+func setKMMDRA(mod *kmmv1beta1.Module, devConfig *awslabsv1beta1.DeviceConfig) {
+	deviceClasses := mapDeviceClasses(devConfig.Spec.DeviceClasses)
+
+	mod.Spec.DRA = &kmmv1beta1.DRASpec{
+		Container: kmmv1beta1.CommonContainerSpec{
+			Image:   devConfig.Spec.DRADriverImage,
+			Command: []string{"k8s-neuron-dra-driver"},
+			Resources: v1.ResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("20m"),
+					v1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+				Limits: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("20m"),
+					v1.ResourceMemory: resource.MustParse("256Mi"),
+				},
+			},
+		},
+		ServiceAccountName: draServiceAccountName,
+		DriverName:         defaultDRADriverName,
+		DeviceClasses:      deviceClasses,
+	}
+	mod.Spec.DevicePlugin = nil
+}
+
+func mapDeviceClasses(dcSpecs []awslabsv1beta1.DeviceClassSpec) []kmmv1beta1.DeviceClassSpec {
+	if len(dcSpecs) == 0 {
+		return []kmmv1beta1.DeviceClassSpec{
+			{
+				Name: defaultDeviceClassName,
+				Selectors: []resourcev1.DeviceSelector{
+					{
+						CEL: &resourcev1.CELDeviceSelector{
+							Expression: `device.driver == "neuron.aws.com"`,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	kmmClasses := make([]kmmv1beta1.DeviceClassSpec, len(dcSpecs))
+	for i, dc := range dcSpecs {
+		kmmClasses[i] = kmmv1beta1.DeviceClassSpec{
+			Name:      dc.Name,
+			Selectors: dc.Selectors,
+			Config:    dc.Config,
+		}
+	}
+	return kmmClasses
 }
 
 func getNodeSelector(devConfig *awslabsv1beta1.DeviceConfig) map[string]string {

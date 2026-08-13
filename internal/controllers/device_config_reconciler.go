@@ -22,9 +22,7 @@ import (
 
 	awslabsv1beta1 "github.com/awslabs/operator-for-ai-chips-on-aws/api/v1beta1"
 	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/configmap"
-	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/constants"
 	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/customscheduler"
-	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/dradriver"
 	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/filter"
 	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/kmmmodule"
 	"github.com/awslabs/operator-for-ai-chips-on-aws/internal/nodemetrics"
@@ -32,7 +30,6 @@ import (
 	kmmv1beta1 "github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	resourcev1 "k8s.io/api/resource/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,10 +46,8 @@ import (
 const (
 	DeviceConfigReconcilerName = "DriverAndPluginReconciler"
 	deviceConfigFinalizer      = "awslabs.node.kubernetes.io/deviceconfig-finalizer"
-	defaultDeviceClassName     = "neuron.aws.com"
 )
 
-// ModuleReconciler reconciles a Module object
 type DeviceConfigReconciler struct {
 	helper deviceConfigReconcilerHelperAPI
 	filter *filter.Filter
@@ -65,10 +60,9 @@ func NewDeviceConfigReconciler(
 	upgradeHandler upgrade.UpgradeAPI,
 	csHandler customscheduler.CustomScheduler,
 	nmHandler nodemetrics.NodeMetrics,
-	draHandler dradriver.DRADriver,
 	filter *filter.Filter,
 	scheme *runtime.Scheme) *DeviceConfigReconciler {
-	helper := newDeviceConfigReconcilerHelper(client, kmmHandler, cmHandler, upgradeHandler, csHandler, nmHandler, draHandler, scheme)
+	helper := newDeviceConfigReconcilerHelper(client, kmmHandler, cmHandler, upgradeHandler, csHandler, nmHandler, scheme)
 	return &DeviceConfigReconciler{
 		helper: helper,
 		filter: filter,
@@ -87,11 +81,6 @@ func (r *DeviceConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.filter.FindDeviceConfigForNodeChange),
 			builder.WithPredicates(r.filter.GetNodePredicate()),
 		).
-		Watches(
-			&resourcev1.DeviceClass{},
-			handler.EnqueueRequestsFromMapFunc(r.filter.DeviceClassToModuleReconcileRequest),
-			builder.WithPredicates(r.filter.HasLabel(constants.DeviceConfigNameLabel)),
-		).
 		Named(DeviceConfigReconcilerName).
 		Complete(
 			reconcile.AsReconciler[*awslabsv1beta1.DeviceConfig](mgr.GetClient(), r),
@@ -105,7 +94,6 @@ func (r *DeviceConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
 //+kubebuilder:rbac:groups=core,resources=configmaps,verbs=create;delete;get;list;patch;watch;create
 //+kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=create;delete;get;list;patch;watch
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=create;delete;get;list;patch;watch
-//+kubebuilder:rbac:groups=resource.k8s.io,resources=deviceclasses,verbs=create;delete;get;list;patch;watch
 //+kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;patch;watch
 
 func (r *DeviceConfigReconciler) Reconcile(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) (ctrl.Result, error) {
@@ -113,7 +101,6 @@ func (r *DeviceConfigReconciler) Reconcile(ctx context.Context, devConfig *awsla
 
 	logger := log.FromContext(ctx).WithValues("namespace", devConfig.Namespace, "name", devConfig.Name)
 	if devConfig.GetDeletionTimestamp() != nil {
-		// DeviceConfig is being deleted
 		err := r.helper.finalizeDeviceConfig(ctx, devConfig)
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to finalize DeviceConfig: %v", err)
@@ -144,19 +131,9 @@ func (r *DeviceConfigReconciler) Reconcile(ctx context.Context, devConfig *awsla
 		return res, fmt.Errorf("failed to handle KMM module version upgrade for DeviceConfig: %v", err)
 	}
 
-	if devConfig.Spec.DRADriverImage != "" {
-		logger.Info("start DRA driver reconciliation")
-		err = r.helper.handleDRADriver(ctx, devConfig)
-		if err != nil {
-			return res, fmt.Errorf("failed to handle DRA driver for DeviceConfig: %v", err)
-		}
-
-		logger.Info("start DeviceClass reconciliation")
-		err = r.helper.handleDeviceClass(ctx, devConfig)
-		if err != nil {
-			return res, fmt.Errorf("failed to handle DeviceClass for DeviceConfig: %v", err)
-		}
-	} else {
+	// In DRA mode, KMM 2.7 handles the DRA DaemonSet and DeviceClasses via spec.dra
+	// on the Module CR. The custom scheduler is only needed for device-plugin mode.
+	if devConfig.Spec.DRADriverImage == "" {
 		logger.Info("start custom scheduler reconciliation")
 		err = r.helper.handleCustomScheduler(ctx, devConfig)
 		if err != nil {
@@ -181,8 +158,6 @@ type deviceConfigReconcilerHelperAPI interface {
 	handleKMMModule(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error
 	handleModuleVersionUpgrade(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error
 	handleCustomScheduler(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error
-	handleDRADriver(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error
-	handleDeviceClass(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error
 	handleNodeMetrics(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error
 }
 
@@ -193,7 +168,6 @@ type deviceConfigReconcilerHelper struct {
 	upgradeHandler upgrade.UpgradeAPI
 	csHandler      customscheduler.CustomScheduler
 	nmHandler      nodemetrics.NodeMetrics
-	draHandler     dradriver.DRADriver
 	scheme         *runtime.Scheme
 }
 
@@ -203,7 +177,6 @@ func newDeviceConfigReconcilerHelper(client client.Client,
 	upgradeHandler upgrade.UpgradeAPI,
 	csHandler customscheduler.CustomScheduler,
 	nmHandler nodemetrics.NodeMetrics,
-	draHandler dradriver.DRADriver,
 	scheme *runtime.Scheme) deviceConfigReconcilerHelperAPI {
 	return &deviceConfigReconcilerHelper{
 		client:         client,
@@ -212,7 +185,6 @@ func newDeviceConfigReconcilerHelper(client client.Client,
 		upgradeHandler: upgradeHandler,
 		csHandler:      csHandler,
 		nmHandler:      nmHandler,
-		draHandler:     draHandler,
 		scheme:         scheme,
 	}
 }
@@ -230,34 +202,13 @@ func (dcrh *deviceConfigReconcilerHelper) setFinalizer(ctx context.Context, devC
 func (dcrh *deviceConfigReconcilerHelper) finalizeDeviceConfig(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error {
 	logger := log.FromContext(ctx)
 
-	deleted, err := dcrh.finalizeDeviceClasses(ctx, devConfig)
-	if err != nil || deleted {
-		return err
-	}
-
-	draDS := appsv1.DaemonSet{}
-	namespacedName := types.NamespacedName{
-		Namespace: devConfig.Namespace,
-		Name:      devConfig.Name + "-dra-driver",
-	}
-
-	err = dcrh.client.Get(ctx, namespacedName, &draDS)
-	if err != nil {
-		if !k8serrors.IsNotFound(err) {
-			return fmt.Errorf("failed to get DRA driver daemonset %s: %v", namespacedName, err)
-		}
-	} else {
-		logger.Info("deleting DRA driver daemonset", "daemonset", namespacedName)
-		return dcrh.client.Delete(ctx, &draDS)
-	}
-
 	nmDS := appsv1.DaemonSet{}
-	namespacedName = types.NamespacedName{
+	namespacedName := types.NamespacedName{
 		Namespace: devConfig.Namespace,
 		Name:      devConfig.Name + "-node-metrics",
 	}
 
-	err = dcrh.client.Get(ctx, namespacedName, &nmDS)
+	err := dcrh.client.Get(ctx, namespacedName, &nmDS)
 	if err != nil {
 		if !k8serrors.IsNotFound(err) {
 			return fmt.Errorf("failed to get nodemetrics daemonset %s: %v", namespacedName, err)
@@ -278,6 +229,8 @@ func (dcrh *deviceConfigReconcilerHelper) finalizeDeviceConfig(ctx context.Conte
 			return fmt.Errorf("failed to get the requested Module %s: %v", namespacedName, err)
 		}
 	} else {
+		// KMM handles cascade deletion of DRA DaemonSets and DeviceClasses
+		// when the Module is deleted.
 		logger.Info("deleting KMM Module", "module", namespacedName)
 		return dcrh.client.Delete(ctx, &mod)
 	}
@@ -291,69 +244,6 @@ func (dcrh *deviceConfigReconcilerHelper) finalizeDeviceConfig(ctx context.Conte
 	devConfigCopy := devConfig.DeepCopy()
 	controllerutil.RemoveFinalizer(devConfig, deviceConfigFinalizer)
 	return dcrh.client.Patch(ctx, devConfig, client.MergeFrom(devConfigCopy))
-}
-
-func (dcrh *deviceConfigReconcilerHelper) finalizeDeviceClasses(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) (bool, error) {
-	logger := log.FromContext(ctx)
-
-	owned, err := dcrh.listOwnedDeviceClasses(ctx, devConfig)
-	if err != nil {
-		return false, err
-	}
-
-	for i := range owned {
-		dc := &owned[i]
-		logger.Info("deleting DeviceClass", "name", dc.Name)
-		return true, dcrh.client.Delete(ctx, dc)
-	}
-
-	return false, nil
-}
-
-func desiredDeviceClassNames(devConfig *awslabsv1beta1.DeviceConfig) map[string]struct{} {
-	desired := make(map[string]struct{})
-	if len(devConfig.Spec.DeviceClasses) == 0 {
-		desired[defaultDeviceClassName] = struct{}{}
-	} else {
-		for _, dcSpec := range devConfig.Spec.DeviceClasses {
-			desired[dcSpec.Name] = struct{}{}
-		}
-	}
-	return desired
-}
-
-func (dcrh *deviceConfigReconcilerHelper) listOwnedDeviceClasses(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) ([]resourcev1.DeviceClass, error) {
-	dcList := &resourcev1.DeviceClassList{}
-	err := dcrh.client.List(ctx, dcList, client.MatchingLabels{
-		constants.DeviceConfigNameLabel:      devConfig.Name,
-		constants.DeviceConfigNamespaceLabel: devConfig.Namespace,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list DeviceClasses for DeviceConfig: %v", err)
-	}
-	return dcList.Items, nil
-}
-
-func (dcrh *deviceConfigReconcilerHelper) deleteOrphanedDeviceClasses(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error {
-	logger := log.FromContext(ctx)
-
-	desired := desiredDeviceClassNames(devConfig)
-	owned, err := dcrh.listOwnedDeviceClasses(ctx, devConfig)
-	if err != nil {
-		return err
-	}
-
-	for i := range owned {
-		dc := &owned[i]
-		if _, ok := desired[dc.Name]; ok {
-			continue
-		}
-		logger.Info("deleting orphaned DeviceClass", "name", dc.Name)
-		if err := dcrh.client.Delete(ctx, dc); err != nil && !k8serrors.IsNotFound(err) {
-			return fmt.Errorf("failed to delete orphaned DeviceClass %s: %v", dc.Name, err)
-		}
-	}
-	return nil
 }
 
 func (dcrh *deviceConfigReconcilerHelper) handleBuildConfigMap(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error {
@@ -451,60 +341,6 @@ func (dcrh *deviceConfigReconcilerHelper) handleCustomScheduler(ctx context.Cont
 
 	if err == nil {
 		logger.Info("Reconciled custom scheduler extension", "namespace", cseDep.Namespace, "name", cseDep.Name, "result", opRes)
-	}
-
-	return err
-}
-
-func (dcrh *deviceConfigReconcilerHelper) handleDRADriver(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error {
-	ds := &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{Namespace: devConfig.Namespace, Name: devConfig.Name + "-dra-driver"},
-	}
-	logger := log.FromContext(ctx)
-	opRes, err := controllerutil.CreateOrPatch(ctx, dcrh.client, ds, func() error {
-		return dcrh.draHandler.SetDRADriverAsDesired(ds, devConfig)
-	})
-
-	if err == nil {
-		logger.Info("Reconciled DRA driver", "namespace", ds.Namespace, "name", ds.Name, "result", opRes)
-	}
-
-	return err
-}
-
-func (dcrh *deviceConfigReconcilerHelper) handleDeviceClass(ctx context.Context, devConfig *awslabsv1beta1.DeviceConfig) error {
-	logger := log.FromContext(ctx)
-
-	if err := dcrh.deleteOrphanedDeviceClasses(ctx, devConfig); err != nil {
-		return err
-	}
-
-	if len(devConfig.Spec.DeviceClasses) > 0 {
-		for i := range devConfig.Spec.DeviceClasses {
-			dcSpec := &devConfig.Spec.DeviceClasses[i]
-			dc := &resourcev1.DeviceClass{
-				ObjectMeta: metav1.ObjectMeta{Name: dcSpec.Name},
-			}
-			opRes, err := controllerutil.CreateOrPatch(ctx, dcrh.client, dc, func() error {
-				return dcrh.draHandler.SetDeviceClassAsDesired(dc, devConfig, dcSpec)
-			})
-			if err != nil {
-				return fmt.Errorf("failed to reconcile DeviceClass %s: %v", dcSpec.Name, err)
-			}
-			logger.Info("Reconciled DeviceClass", "name", dc.Name, "result", opRes)
-		}
-		return nil
-	}
-
-	dc := &resourcev1.DeviceClass{
-		ObjectMeta: metav1.ObjectMeta{Name: defaultDeviceClassName},
-	}
-	opRes, err := controllerutil.CreateOrPatch(ctx, dcrh.client, dc, func() error {
-		return dcrh.draHandler.SetDeviceClassAsDesired(dc, devConfig, nil)
-	})
-
-	if err == nil {
-		logger.Info("Reconciled DeviceClass", "name", dc.Name, "result", opRes)
 	}
 
 	return err

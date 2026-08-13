@@ -25,7 +25,9 @@ import (
 	. "github.com/onsi/gomega"
 	kmmv1beta1 "github.com/rh-ecosystem-edge/kernel-module-management/api/v1beta1"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -167,6 +169,155 @@ var _ = Describe("SetKMMModuleAsDesired", func() {
 		Expect(mod.Spec.ModuleLoader).ToNot(BeNil())
 		Expect(mod.Spec.DevicePlugin).ToNot(BeNil())
 		Expect(mod.Spec.DevicePlugin.Container.Image).To(Equal("some device plugin image"))
+	})
+
+	It("should set DRA when DRADriverImage is provided", func() {
+		mod := &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+		}
+		input := &awslabsv1beta1.DeviceConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+			Spec: awslabsv1beta1.DeviceConfigSpec{
+				DriversImage:   "some image:tag",
+				DRADriverImage: "some-dra-image:latest",
+			},
+		}
+
+		err := km.SetKMMModuleAsDesired(mod, input)
+		Expect(err).To(BeNil())
+		Expect(mod.Spec.ModuleLoader).ToNot(BeNil())
+		Expect(mod.Spec.DRA).ToNot(BeNil())
+		Expect(mod.Spec.DevicePlugin).To(BeNil())
+		Expect(mod.Spec.DRA.Container.Image).To(Equal("some-dra-image:latest"))
+		Expect(mod.Spec.DRA.DriverName).To(Equal("neuron.aws.com"))
+		Expect(mod.Spec.DRA.ServiceAccountName).To(Equal("awslabs-gpu-operator-dra-driver"))
+		Expect(mod.Spec.DRA.Container.Command).To(Equal([]string{"k8s-neuron-dra-driver"}))
+	})
+
+	It("should set DRA with default DeviceClass when none specified", func() {
+		mod := &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+		}
+		input := &awslabsv1beta1.DeviceConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+			Spec: awslabsv1beta1.DeviceConfigSpec{
+				DriversImage:   "some image:tag",
+				DRADriverImage: "some-dra-image:latest",
+			},
+		}
+
+		err := km.SetKMMModuleAsDesired(mod, input)
+		Expect(err).To(BeNil())
+		Expect(mod.Spec.DRA.DeviceClasses).To(HaveLen(1))
+		Expect(mod.Spec.DRA.DeviceClasses[0].Name).To(Equal("neuron.aws.com"))
+		Expect(mod.Spec.DRA.DeviceClasses[0].Selectors).To(HaveLen(1))
+		Expect(mod.Spec.DRA.DeviceClasses[0].Selectors[0].CEL.Expression).To(Equal(`device.driver == "neuron.aws.com"`))
+	})
+
+	It("should set DRA with custom DeviceClasses when specified", func() {
+		mod := &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+		}
+		input := &awslabsv1beta1.DeviceConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+			Spec: awslabsv1beta1.DeviceConfigSpec{
+				DriversImage:   "some image:tag",
+				DRADriverImage: "some-dra-image:latest",
+				DeviceClasses: []awslabsv1beta1.DeviceClassSpec{
+					{
+						Name: "custom-class-a",
+						Selectors: []resourcev1.DeviceSelector{
+							{
+								CEL: &resourcev1.CELDeviceSelector{
+									Expression: `device.driver == "custom.driver"`,
+								},
+							},
+						},
+					},
+					{
+						Name: "custom-class-b",
+					},
+				},
+			},
+		}
+
+		err := km.SetKMMModuleAsDesired(mod, input)
+		Expect(err).To(BeNil())
+		Expect(mod.Spec.DRA.DeviceClasses).To(HaveLen(2))
+		Expect(mod.Spec.DRA.DeviceClasses[0].Name).To(Equal("custom-class-a"))
+		Expect(mod.Spec.DRA.DeviceClasses[0].Selectors).To(HaveLen(1))
+		Expect(mod.Spec.DRA.DeviceClasses[1].Name).To(Equal("custom-class-b"))
+	})
+
+	It("DRA mode should clear DevicePlugin if previously set", func() {
+		mod := &kmmv1beta1.Module{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+		}
+		mod.Spec.DevicePlugin = &kmmv1beta1.DevicePluginSpec{
+			Container: kmmv1beta1.CommonContainerSpec{
+				Image: "old-device-plugin",
+			},
+		}
+		input := &awslabsv1beta1.DeviceConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "moduleName",
+				Namespace: "moduleNamespace",
+			},
+			Spec: awslabsv1beta1.DeviceConfigSpec{
+				DriversImage:   "some image:tag",
+				DRADriverImage: "some-dra-image:latest",
+			},
+		}
+
+		err := km.SetKMMModuleAsDesired(mod, input)
+		Expect(err).To(BeNil())
+		Expect(mod.Spec.DevicePlugin).To(BeNil())
+		Expect(mod.Spec.DRA).ToNot(BeNil())
+	})
+})
+
+var _ = Describe("setKMMDRA", func() {
+	It("sets correct container spec", func() {
+		mod := &kmmv1beta1.Module{}
+		input := &awslabsv1beta1.DeviceConfig{
+			Spec: awslabsv1beta1.DeviceConfigSpec{
+				DRADriverImage: "my-dra-image:v1",
+			},
+		}
+
+		setKMMDRA(mod, input)
+
+		Expect(mod.Spec.DRA).ToNot(BeNil())
+		Expect(mod.Spec.DRA.Container.Image).To(Equal("my-dra-image:v1"))
+		Expect(mod.Spec.DRA.Container.Command).To(Equal([]string{"k8s-neuron-dra-driver"}))
+		Expect(mod.Spec.DRA.Container.Resources.Requests[v1.ResourceCPU]).To(Equal(resource.MustParse("20m")))
+		Expect(mod.Spec.DRA.Container.Resources.Requests[v1.ResourceMemory]).To(Equal(resource.MustParse("256Mi")))
+		Expect(mod.Spec.DRA.Container.Resources.Limits[v1.ResourceCPU]).To(Equal(resource.MustParse("20m")))
+		Expect(mod.Spec.DRA.Container.Resources.Limits[v1.ResourceMemory]).To(Equal(resource.MustParse("256Mi")))
+		Expect(mod.Spec.DRA.DriverName).To(Equal("neuron.aws.com"))
+		Expect(mod.Spec.DRA.ServiceAccountName).To(Equal("awslabs-gpu-operator-dra-driver"))
+		Expect(mod.Spec.DevicePlugin).To(BeNil())
 	})
 })
 
